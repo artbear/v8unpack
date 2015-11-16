@@ -8,7 +8,7 @@
 /////////////////////////////////////////////////////////////////////////////
 
 /**
-    2014            dmpas       sergey(dot)batanov(at)dmpas(dot)ru
+    2014-2015       dmpas       sergey(dot)batanov(at)dmpas(dot)ru
  */
 
 // V8File.cpp: implementation of the CV8File class.
@@ -19,6 +19,7 @@
 #include "V8File.h"
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
+#include <iostream>
 
 #ifndef MAX_PATH
 #define MAX_PATH (260)
@@ -79,13 +80,13 @@ int CV8File::Inflate(const std::string &in_filename, const std::string &out_file
     int ret;
 
     boost::filesystem::path inf(in_filename);
-    boost::filesystem::ifstream in_file(inf);
+    boost::filesystem::ifstream in_file(inf, std::ios_base::binary);
 
     if (!in_file)
         return V8UNPACK_INFLATE_IN_FILE_NOT_FOUND;
 
     boost::filesystem::path ouf(out_filename);
-    boost::filesystem::ofstream out_file(ouf);
+    boost::filesystem::ofstream out_file(ouf, std::ios_base::binary);
 
     if (!out_file)
         return V8UNPACK_INFLATE_OUT_FILE_NOT_CREATED;
@@ -112,7 +113,7 @@ int CV8File::Deflate(const std::string &in_filename, const std::string &out_file
         return V8UNPACK_DEFLATE_IN_FILE_NOT_FOUND;
 
     boost::filesystem::path ouf(out_filename);
-    boost::filesystem::ofstream out_file(ouf);
+    boost::filesystem::ofstream out_file(ouf, std::ios_base::binary);
 
     if (!out_file)
         return V8UNPACK_DEFLATE_OUT_FILE_NOT_CREATED;
@@ -146,7 +147,7 @@ int CV8File::Deflate(std::basic_ifstream<char> &source, std::basic_ofstream<char
 
     // compress until end of file
     do {
-        strm.avail_in = source.readsome(reinterpret_cast<char *>(in), CHUNK);
+        strm.avail_in = source.read(reinterpret_cast<char *>(in), CHUNK).gcount();
         if (source.bad()) {
             (void)deflateEnd(&strm);
             return Z_ERRNO;
@@ -202,7 +203,7 @@ int CV8File::Inflate(std::basic_ifstream<char> &source, std::basic_ofstream<char
         return ret;
 
     do {
-        strm.avail_in = source.readsome(reinterpret_cast<char *>(in), CHUNK);
+        strm.avail_in = source.read(reinterpret_cast<char *>(in), CHUNK).gcount();
         if (source.bad()) {
             (void)inflateEnd(&strm);
             return Z_ERRNO;
@@ -460,20 +461,182 @@ int CV8File::LoadFile(char *pFileData, ULONG FileDataSize, bool boolInflate, boo
     if (InflateBuffer)
         free(InflateBuffer);
 
+	delete [] pElemsAddrs;
 
     return ret;
 }
 
+void CV8File::Dispose()
+{
+    std::vector<CV8Elem>::iterator elem;
+    for (elem = Elems.begin(); elem != Elems.end(); ++elem) {
+        if (elem->pData)
+            delete [] elem->pData;
+        if (elem->pHeader)
+            delete [] elem->pHeader;
+    }
+    Elems.clear();
+}
+
+//++ dmpas Затычка Issue6
+
+// Нѣкоторый условный предѣл
+const size_t SmartLimit = 100 *1024;
+
+/*
+    Лучше всѣго сжимается текст
+    Берём степень сжатія текста в 99% (объём распакованных данных в 100 раз больше)
+    Берём примѣрный порог использованія памяти в 10МБ (в этот объём должы влезть распакованные данные)
+    Дѣлим 10МБ на 100 и получаем 100 КБ
+    Упакованные данные размѣром до 100 КБ можно спокойно обрабатывать в памяти
+
+    В дальнейшем этот показатель всё же будет вынесен в параметр командной строки
+*/
+
+int SmartUnpack(std::basic_ifstream<char> &file, bool NeedUnpack, boost::filesystem::path &elem_path)
+{
+    CV8File::stBlockHeader header;
+    file.read((char*)&header, sizeof(header));
+
+    int ret = 0;
+
+    size_t data_size = CV8File::_httoi(header.data_size_hex);
+    if (!NeedUnpack || data_size > SmartLimit) {
+        /* 1) Имѣем дѣло с условно большими данными - работаем через промежуточный файл */
+        /* 2) Не нужна распаковка - пишем прямо в файл-приёмник */
+
+        boost::filesystem::ifstream src;
+
+        boost::filesystem::path tmp_path = elem_path.parent_path() / ".v8unpack.tmp";
+        boost::filesystem::path inf_path = elem_path.parent_path() / ".v8unpack.inf";
+        boost::filesystem::path src_path;
+
+        if (NeedUnpack) {
+            /* Временный файл */
+
+            boost::filesystem::ofstream out;
+
+            out.open(tmp_path, std::ios_base::binary);
+            UINT BlockDataSize = 0;
+            CV8File::ReadBlockData(file, &header, out, &BlockDataSize);
+            out.close();
+
+            out.open(inf_path, std::ios_base::binary);
+            boost::filesystem::ifstream inf(tmp_path, std::ios_base::binary);
+
+            ret = CV8File::Inflate(inf, out);
+
+            if (ret) {
+                // Файл не распаковывается - записываем, как есть
+                inf.seekg(0, std::ios_base::beg);
+
+                do {
+
+                    const int block_size = 4096;
+                    char data[block_size]; // TODO: Оценить размер блока
+                    int data_size = inf.read(data, block_size).gcount();
+
+                    if (data_size != 0)
+                        out.write(data, data_size);
+
+                } while (inf);
+
+            }
+
+            inf.close();
+            boost::filesystem::remove(tmp_path);
+            out.close();
+
+            src_path = inf_path;
+
+        } else {
+            /* Конечный файл */
+            boost::filesystem::ofstream out;
+            out.open(tmp_path, std::ios_base::binary);
+            UINT BlockDataSize = 0;
+            CV8File::ReadBlockData(file, &header, out, &BlockDataSize);
+            out.close();
+
+            src_path = tmp_path;
+        }
+
+        src.open(src_path, std::ios_base::binary);
+
+        if (CV8File::IsV8File(src)) {
+            CV8File elem;
+            elem.UnpackToDirectoryNoLoad(elem_path.string(), src, data_size, false, false);
+            src.close();
+            elem.Dispose();
+            boost::filesystem::remove(src_path);
+        } else {
+            src.close();
+            boost::system::error_code error;
+            boost::filesystem::rename(src_path, elem_path, error);
+        }
+
+
+    } else {
+
+        /* Имѣем полное право помѣстить файл в память */
+
+        UINT uDataSize;
+        char *source_data = NULL;
+
+        CV8File::ReadBlockData(file, &header, source_data, &uDataSize);
+
+        char *out_data = NULL;
+        ULONG out_data_size = 0;
+
+        ret = CV8File::Inflate(source_data, &out_data, uDataSize, &out_data_size);
+        if (ret) {
+
+            // файл не распаковывается - записываем, как есть
+            out_data = source_data;
+            out_data_size = uDataSize;
+
+            source_data = NULL;
+        }
+
+        delete [] source_data;
+
+        if (CV8File::IsV8File(out_data, uDataSize)) {
+            /* Это 8-файл - раскладываем его*/
+
+            CV8File elem;
+            elem.LoadFile(out_data, out_data_size, false, false);
+            elem.SaveFileToFolder(elem_path.string());
+
+            elem.Dispose();
+
+        } else {
+            /* Тупо пишем содержимое в цѣлевой файл*/
+
+            boost::filesystem::ofstream out(elem_path, std::ios_base::binary);
+            out.write(out_data, out_data_size);
+
+        }
+
+		free(out_data);
+
+    }
+
+    return ret;
+}
+//-- dmpas Затычка Issue6
 
 int CV8File::UnpackToDirectoryNoLoad(const std::string &directory, std::basic_ifstream<char> &file, ULONG FileDataSize, bool boolInflate, bool UnpackWhenNeed)
 {
     int ret = 0;
 
+    if (!IsV8File(file)) {
+        return V8UNPACK_NOT_V8_FILE;
+    }
+
     boost::filesystem::path p_dir(directory);
 
     if (!boost::filesystem::exists(p_dir)) {
         if (!boost::filesystem::create_directory(directory)) {
-            std::cerr << "UnpackToFolder. Error in creating directory!" << std::endl;
+            std::cerr << "UnpackToDirectoryNoLoad. Error in creating directory!" << std::endl;
             return ret;
         }
     }
@@ -524,94 +687,22 @@ int CV8File::UnpackToDirectoryNoLoad(const std::string &directory, std::basic_if
         GetElemName(elem, ElemName, &ElemNameLen);
 
         boost::filesystem::path elem_path(p_dir / ElemName);
-
-        boost::filesystem::ofstream o_tmp(p_dir / ".v8unpack.tmp", std::ios_base::binary);
+        elem_path = boost::filesystem::absolute(elem_path);
 
         //080228 Блока данных может не быть, тогда адрес блока данных равен 0x7fffffff
         if (pElemsAddrs[i].elem_data_addr != V8_FF_SIGNATURE) {
-
             file.seekg(pElemsAddrs[i].elem_data_addr, std::ios_base::beg);
-            file.read((char*)&BlockHeader, sizeof(BlockHeader));
-
-            ReadBlockData(file, pBlockHeader, o_tmp, &elem.DataSize);
+            SmartUnpack(file, boolInflate && IsDataPacked, elem_path);
         } else {
             // TODO: Зачем это нужно??
-            ReadBlockData(file, NULL, o_tmp, &elem.DataSize);
+            //ReadBlockData(file, NULL, o_tmp, &elem.DataSize);
         }
 
-        o_tmp.close();
+		delete [] elem.pHeader;
 
-        boost::filesystem::ifstream i_tmp(p_dir / ".v8unpack.tmp", std::ios_base::binary);
+     } // for i = ..ElemsNum
 
-        elem.UnpackedData.IsDataPacked = false;
-
-        if (boolInflate && IsDataPacked) {
-
-            boost::filesystem::ofstream o_inf(p_dir / ".v8unpack.inf", std::ios_base::binary);
-            ret = Inflate(i_tmp, o_inf);
-            o_inf.close();
-
-            boost::filesystem::ifstream i_inf(p_dir / ".v8unpack.inf", std::ios_base::binary);
-
-            if (ret)
-                IsDataPacked = false;
-            else {
-
-                elem.NeedUnpack = false; // отложенная распаковка не нужна
-                if (IsV8File(i_inf)) {
-
-                    ret = elem.UnpackedData.UnpackToDirectoryNoLoad(elem_path.string(), i_inf, 0, boolInflate);
-                    if (ret)
-                        break;
-
-                } else {
-                    boost::filesystem::ofstream out(elem_path, std::ios_base::binary);
-
-                    i_inf.seekg(0, std::ios_base::beg);
-                    i_inf.clear();
-
-                    while (i_inf) {
-
-                        const int buf_size = 1024;
-                        char buf[buf_size];
-                        int rd = i_inf.readsome(buf, buf_size);
-
-                        if (rd)
-                            out.write(buf, rd);
-                        else
-                            break;
-                    }
-                }
-                ret = 0;
-            }
-
-        } else {
-
-            i_tmp.seekg(0, std::ios_base::beg);
-            i_tmp.clear();
-
-            boost::filesystem::ofstream out(elem_path, std::ios_base::binary);
-            while (!i_tmp.eof()) {
-
-                const int buf_size = 1024;
-                char buf[buf_size];
-                int rd = i_tmp.readsome(buf, buf_size);
-
-                if (rd)
-                    out.write(buf, rd);
-                else
-                    break;
-            }
-            ret = 0;
-        }
-
-    } // for i = ..ElemsNum
-
-    if (boost::filesystem::exists(p_dir / ".v8unpack.inf"))
-        boost::filesystem::remove(p_dir / ".v8unpack.inf");
-
-    if (boost::filesystem::exists(p_dir / ".v8unpack.tmp"))
-        boost::filesystem::remove(p_dir / ".v8unpack.tmp");
+	delete [] pElemsAddrs;
 
     return ret;
 }
@@ -640,7 +731,7 @@ int CV8File::UnpackToFolder(const std::string &filename_in, const std::string &d
         return -1;
     }
 
-    size_t sz_r = file_in.readsome(reinterpret_cast<char*>(pFileData), FileDataSize);
+    size_t sz_r = file_in.read(reinterpret_cast<char*>(pFileData), FileDataSize).gcount();
     if (sz_r != FileDataSize) {
         std::cerr << "UnpackToFolder. Error in reading file!" << std::endl;
         return sz_r;
@@ -902,6 +993,8 @@ bool CV8File::IsV8File(std::basic_ifstream<char> &file)
 
     stBlockHeader *pBlockHeader = &BlockHeader;
 
+	memset(pBlockHeader, 0, sizeof(BlockHeader));
+
     std::ifstream::pos_type offset = file.tellg();
 
     file.read((char*)&FileHeader, sizeof(FileHeader));
@@ -1083,6 +1176,11 @@ int CV8File::Parse(const std::string &filename_in, const std::string &dirname, i
 
     ret = UnpackToDirectoryNoLoad(dirname, file_in, FileDataSize);
 
+    if (ret == V8UNPACK_NOT_V8_FILE) {
+        std::cerr << "UnpackToFolder. This is not V8 file!" << std::endl;
+        return ret;
+    }
+
     std::cout << "LoadFile: ok" << std::endl;
 
     return ret;
@@ -1094,10 +1192,12 @@ int CV8File::SaveFileToFolder(const std::string &dirname) const
 
     int ret = 0;
 
-    ret = boost::filesystem::create_directory(dirname);
-    if (ret && errno == ENOENT) {
-        std::cerr << "UnpackToFolder. Error in creating directory!" << std::endl;
-        return ret;
+    if (!boost::filesystem::exists(dirname)) {
+        ret = !boost::filesystem::create_directory(dirname);
+        if (ret && errno == ENOENT) {
+            std::cerr << "SaveFileToFolder. Error in creating directory `" << dirname << "` !" << std::endl;
+            return ret;
+        }
     }
     ret = 0;
 
@@ -1225,7 +1325,7 @@ int CV8File::LoadFileFromFolder(const std::string &dirname)
             elem.pData = new char[elem.DataSize];
 
             boost::filesystem::ifstream file_in(current_file, std::ios_base::binary);
-            file_in.readsome(reinterpret_cast<char *>(elem.pData), elem.DataSize);
+            file_in.read(reinterpret_cast<char *>(elem.pData), elem.DataSize);
         }
 
         Elems.push_back(elem);

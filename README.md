@@ -21,6 +21,30 @@ Windows, POSIX
 Project for [codelite IDE](http://www.codelite.org/)  
 Project for [Codeblocks IDE](http://codeblocks.org/)
 
+## Build
+
+Артефакты/релизы можно скачать с [build-server проекта](https://build.batanov.me/job/v8unpack-win/)
+
+[Прямая ссылка на последнюю успешную сборку win32](https://build.batanov.me/view/e8-script/job/v8unpack-win/label=mingw32/lastSuccessfulBuild/artifact/bin/Release/*zip*/v8unpack.zip)
+
+[Прямая ссылка на последнюю успешную сборку win64](https://build.batanov.me/view/e8-script/job/v8unpack-win/label=mingw64/lastSuccessfulBuild/artifact/bin/Release/*zip*/v8unpack.zip)
+
+### Ubuntu/Debian
+
+```
+sudo apt-add-repository ppa:dmpas/e8
+sudo apt-get update
+sudo apt-get install v8unpack
+```
+
+### Fedora\Centos
+```
+cd /etc/yum.repos.d/
+sudo wget http://download.opensuse.org/repositories/home:/pumbaEO/Fedora_22/home:pumbaEO.repo
+sudo dnf install v8unpack
+```
+
+
 ## Version 3.0
 
 - Оптимизирована сборка .cf файла ключ -B[UILD]. В версии 2.0 сборка корневого контейнера происходила в оперативной памяти.
